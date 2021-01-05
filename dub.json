@@ -1,0 +1,8 @@
+{
+	"authors": ["ARAWI_Kohei"],
+	"copyright": "Copyright © 2020, ARAWI_Kohei",
+	"description": "Data registration to SQL from CSV.",
+	"license": "proprietary",
+	"name": "csvtosql",
+	"dependencies": {"dpq2": "1.0.11"}
+}
