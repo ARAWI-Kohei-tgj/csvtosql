@@ -4,15 +4,20 @@
 module modes.costs;
 
 import dpq2;
-import crops: Crop;
+import crops: Crops;
+import frontend: Settings;
 
-void registerCosts(Connection conn, in Crop crop, in string dataStrCSV) @system{
+void registerCosts(Connection conn,
+		   in Crops crop, in Settings spc, in string dataStrCSV) @system{
   import std.conv: to;
   import std.csv;
+  import std.datetime: Date;
+  import std.stdio: writefln;
   import crops: cropNameStr;
 
   string cropName= cropNameStr(crop);
   QueryParams cmdCosts, cmdInsentive, cmdReward;
+  Date objDate;
 
   with(cmdCosts){	// For table `shipment_costs'
     args.length= 6;
@@ -43,7 +48,7 @@ WHERE NOT EXISTS(SELECT *
     args[1]= toValue(cropName);
   }
 
-  with(cmdReward){
+  with(cmdReward){	// For table `shipment_reward'
     args.length= 4;
     sqlCommand= q{
 INSERT INTO shipment_reward
@@ -61,9 +66,42 @@ WHERE NOT EXISTS(SELECT *
   enum string[6] valueHeader= ["振込日", "市場手数料", "出荷奨励金", "農協手数料",
 			       "運賃", "保険負担金"];
 
-  foreach(record; csvReader!(string[string])(dataStrCSV)){
+  // date of the latest quantity data
+  const Date dateStart= (in Settings spec, in Crops theCrop){
+    import frontend: Mode;
+    immutable queryStr= "SELECT MAX(shipment_date) "
+      ~"FROM shipment_costs "
+      ~"WHERE crop_name = '" ~cropNameStr(theCrop)  ~"';";
+    Date result;
+
+    if(spc.isSetStart){
+      result= spc.dateStart;
+    }
+    else{
+      if(spc.mode == Mode.append){ // automatically acquisition
+	auto ans= conn.exec(queryStr);
+	result= Date.fromISOExtString(ans[0][0].as!string);
+      }
+      else{}
+    }
+    return result;
+  }(spc, crop);
+
+  foreach(record; csvReader!(string[string])(dataStrCSV, null)){
+    objDate= Date.fromISOExtString(record["出荷日[yyyy-MM-dd]"]);
+
+    if(spc.isSetStart && objDate < dateStart){
+      writefln!"NOTICE: data of %s is skipped"(objDate.toISOExtString);
+      continue;
+    }
+
+    if(spc.isSetEnd && objDate > spc.dateEnd){
+      writefln!"NOTICE: data of %s is skipped"(objDate.toISOExtString);
+      continue;
+    }
+
     with(cmdCosts){
-      args[0]= toValue(record["出荷日[yyyy-MM-dd]"]);
+      args[0]= toValue(objDate.toISOExtString);
       args[2]= toValue(record["市場手数料"]);
       args[3]= toValue(record["農協手数料"]);
       args[4]= toValue(record["運賃"]);
@@ -72,13 +110,13 @@ WHERE NOT EXISTS(SELECT *
     conn.execParams(cmdCosts);
 
     with(cmdInsentive){
-      args[0]= toValue(record["出荷日[yyyy-MM-dd]"]);
+      args[0]= toValue(objDate.toISOExtString);
       args[2]= toValue(record["出荷奨励金"]);
     }
     conn.execParams(cmdInsentive);
 
     with(cmdReward){
-      args[0]= toValue(record["出荷日[yyyy-MM-dd]"]);
+      args[0]= toValue(objDate.toISOExtString);
       args[2]= toValue(record["振込日[yyyy-MM-dd]"]);
     }
     conn.execParams(cmdReward);

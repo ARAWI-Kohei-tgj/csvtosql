@@ -1,94 +1,73 @@
 /******************************************************************************
  *
+ *
+ * csvtosql [condition] directory_path
+ *
+ * condition: lhs= value
+ * (lhs, value): (-mode, [overwrite, append, delete]),
+ *             : (-start, [dddd]),
+ *             : (-end, [dddd])
+ *
+ * if mode=delete then `start' and `end' are not null
+ *
+ * .. logs -+- 20xx -+- crops -+- ...
+ *          |        |         +- ...
+ *          |        |
+ *          |        +- transaction
+ *          |
+ *          +- 20xy -+- crops
  ******************************************************************************/
 import dpq2;
 import std.stdio;
-import std.traits: isSomeChar;
 
-//enum Mode: ubyte{nil, history, costs, price}
-
-string removeComments(Char, Char CommentChar= '#')(in immutable(Char)[] fname) @system
-if(isSomeChar!Char){
-  import std.typecons: Yes;
-  import std.stdio: File;
-
-  string result;
-  foreach(row; File(fname, "r").byLine(Yes.keepTerminator)){
-    if(row[0] != CommentChar) result ~= row;
-    else result ~= row[1..$];
-  }
-  return result;
-}
 
 // csvtosql /home/arai_kohei/Documents/agriculture/logs/2020/crops/eggplant
 void main(in string[] args){
+  import std.algorithm: splitter;
+  import frontend;
+  import process;
   import crops;
   import modes.quantity;
   import modes.costs;
   import modes.price;
 
   immutable string csvExt= ".csv";
+  const Settings spc= commandLineProcess(args[1..$]);
 
-  const string csvFilePath= args[1];
+  /+
+  writefln!"mode= %s"(spc.mode);
+  writefln!"start date= %s"(spc.dateStart);
+  writefln!"end date= %s"(spc.dateEnd);
+  writefln!"directory= %s"(spc.dirPath);
++/
 
-  const Crop crop= (in string str) @safe pure{
-    import std.range: tail;
-    import std.string: lastIndexOf;
-    import std.array: split;
+  const string[] dirSeq= (in string str) @safe pure{
+    import std.algorithm: find;
+    import std.array: array;
+    import std.path: pathSplitter;
+    import std.range: empty;
 
-    Crop result;
-    string[] token= str.split("/");
-
-    switch(token[$-1]){
-    case "eggplant":
-      result= Crop.eggplant;
-      break;
-    case "zucchini":
-      result= Crop.zucchini;
-      break;
-    case "shrinked_spinach":
-      result= Crop.shrinkedSpinach;
-      break;
-    default:
-      throw new Exception("Error: invalid crop name `" ~token[$-1] ~"'.");
+    auto result= pathSplitter(str).find("logs").array;
+    if(result.empty ||
+       (result[2] == "crops" && result.length < 4) ||
+       (result[2] == "transaction" && result.length < 3)){
+      throw new Exception("Error: invalid directory structure.");
     }
 
-    return result;
-  }(csvFilePath);
-  assert(crop !is Crop.nil, "Bug: identification of crop is failed.");
+    return result.array;
+  }(spc.dirPath);
 
-  const string[3] fnameCSV= (in string str) @system{
-    import std.array: split;
-    import std.file: exists;
-    import std.path: extension, isValidPath;
-    import std.range: take;
+  // checking year
+  (in string str) @safe pure{
+    import std.algorithm: all;
+    import std.ascii: isDigit;
 
-    string[3] results;
-    const string yearStr= (string theToken){
-      string result;
-      if(theToken.length == 4) result= theToken;
-      else{
-	throw new Exception("Error: Invalid directory structure.");
-      }
-      return result;
-    }(str.split("/")[$-2]);
-
-    if(isValidPath(str)){
-      results[0]= str ~"/shipment_" ~yearStr ~".csv";
-      results[1]= str ~"/costs_" ~yearStr ~".csv";
-      results[2]= str ~"/price_" ~yearStr ~".csv";
-      foreach(fname; results){
-	if(!exists(fname)){
-	  throw new Exception("Error: file `" ~fname ~"' does not exist.");
-	}
-	else continue;
-      }
-    }
+    if(str.length == 4
+       && str.all!(a => isDigit(a))){}
     else{
-      throw new Exception("Error: invalid path `" ~str ~"'.");
+      throw new Exception("Error: Invalid directory structure.");
     }
-    return results;
-  }(csvFilePath);
+  }(dirSeq[1]);
 
   // DB connection
   Connection toAgriDB= (in string loginID, in string password) @system{
@@ -103,8 +82,82 @@ void main(in string[] args){
     return new Connection(str);
   }("arawi_kohei", "2sc1815_2sa1015_");
 
-  //
-  registerQuantity(toAgriDB, crop, removeComments(fnameCSV[0]));
-  registerCosts(toAgriDB, crop, removeComments(fnameCSV[1]));
-  registerPrice(toAgriDB, crop, removeComments(fnameCSV[2]));
+  // action mode (crop or transaction)
+  switch(dirSeq[2]){
+  case "crops":
+      // checking crop name
+    const Crops crop= (in string token) @safe pure{
+      import std.range: tail;
+      import std.string: lastIndexOf;
+      import std.array: split;
+      Crops result;
+
+      switch(token){
+      case "eggplant":
+	result= Crops.eggplant;
+	break;
+      case "zucchini":
+	result= Crops.zucchini;
+	break;
+      case "shrinked_spinach":
+	result= Crops.shrinkedSpinach;
+	break;
+      default:
+	throw new Exception("Error: invalid crop name `" ~token ~"'.");
+      }
+
+      return result;
+    }(dirSeq[3]);
+    //assert(crop !is Crops.nil, "Bug: identification of crop is failed.");
+
+    registerCropData(toAgriDB, crop, spc);
+    break;
+
+  case "transaction":
+    // duplication avoidance
+    final switch(spc.mode){
+    case Mode.append:
+      const size_t numAlreadyExists= (Connection conn){
+	enum string QUERY_STR= `SELECT COUNT(summary)
+FROM account_voucher
+WHERE tr_date >= $1::DATE AND tr_date < $2::DATE;`;
+	QueryParams cmd;
+	cmd.sqlCommand= QUERY_STR;
+	cmd.args.length= 2;
+	cmd.args[0]= toValue(spc.dateStart.toISOExtString);
+	cmd.args[1]= toValue(spc.dateEnd.toISOExtString);
+
+	auto result= conn.execParams(cmd);
+	return result[0][0].as!long;
+      }(toAgriDB);
+
+      if(numAlreadyExists > 0){
+	import std.array: appender;
+	import std.format: formattedWrite;
+	enum string MSG= "Error: %d data arleady exist in table `account_voucher', however, these cannot be deleted.  Please re-execute with `overwrite' mode.";
+	auto buf= appender!string;
+	buf.formattedWrite!MSG(numAlreadyExists);
+	throw new Exception(buf.data);
+      }
+      break;
+    case Mode.overwrite:
+      (Connection conn){
+	enum string QUERY_STR= `DELETE FROM account_voucher
+WHERE tr_date >= $1::DATE AND tr_date < $2::DATE;`;
+	QueryParams cmd;
+	cmd.sqlCommand= QUERY_STR;
+	cmd.args.length= 2;
+	cmd.args[0]= toValue(spc.dateStart.toISOExtString);
+	cmd.args[1]= toValue(spc.dateEnd.toISOExtString);
+
+	conn.execParams(cmd);
+	writefln!"NOTICE: Old data in table `account_voucher' have deleted.";
+      }(toAgriDB);
+    }
+
+    registerTransactionData(toAgriDB, spc);	// registeration
+    break;
+  default:
+    throw new Exception("Error: Invalid action mode. Only `crops' and `transaction' are enable.");
+  }
 }
