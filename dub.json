@@ -4,5 +4,7 @@
 	"description": "Data registration to SQL from CSV.",
 	"license": "proprietary",
 	"name": "csvtosql",
-	"dependencies": {"dpq2": "1.0.19"}
+  "dependencies": {
+    "dpq2": "~master"
+  }
 }

@@ -2,101 +2,134 @@ module modes.quantity;
 
 import dpq2;
 import crops: Crops;
+import postgresql: DataBaseAccess;
 import frontend: Settings;
+import csvmanip: FilteredCSV;
 
+/*************************************************************
+ *
+ *
+ * Database append:
+ *  table 'list_of_trs'
+ *  table 'shipment_quantity'
+ *  table 'shipment_package'
+ *************************************************************/
 void registerQuantity(Connection conn,
-		      in Crops crop, in Settings spc, in string dataStrCSV) @system{
-  import std.conv: to;
-  import std.csv;
-  import std.datetime: Date;
-  import crops: cropNameStr;
-  import std.stdio: writefln;
+		      in Crops crop,
+		      in Settings spc,
+		      in FilteredCSV!dstring bufCSV) @system{
+	import std.conv: to;
+	import std.csv;
+	import std.datetime: Date;
+	import crops: cropNameStr;
+	import std.stdio: writefln;
 
-  uint totalMass;
-  const string cropName= cropNameStr(crop);
-  QueryParams cmd1, cmd2;
+	uint totalMass;
+	const string cropName= cropNameStr(crop);
 
-  with(cmd1){	// shipment_quantity
-    args.length= 4;
-    sqlCommand= q{
-INSERT INTO shipment_quantity
+	// shipment_quantity
+	@(DataBaseAccess.append) QueryParams cmd1= () @safe pure{
+		QueryParams result;
+		with(result){
+			sqlCommand= `INSERT INTO shipment_quantity
 SELECT *
-FROM (VALUES ($1::DATE, $2::TEXT, $3::VARCHAR(3), $4::SMALLINT)
-      ) AS temp(shipment_date, crop_name, class_, mass)
+FROM (VALUES ($1::INTEGER, $2::VARCHAR(3), $3::SMALLINT)
+      ) AS temp(tr_id, class_, mass)
 WHERE NOT EXISTS(
   SELECT *
   FROM shipment_quantity
-  WHERE shipment_date = $1::DATE
-    AND crop_name = $2::TEXT
-    AND class_ = $3::VARCHAR(3));};
-    args[1]= toValue(cropName);
-  }
+  WHERE tr_id = $1::INTEGER
+    AND class_ = $2::VARCHAR(3));`;
+			args.length= 3;
+		}
+		return result;
+	}();
 
-  with(cmd2){	// shipment_package
-    args.length= 4;
-    sqlCommand= q{
-INSERT INTO shipment_package
+	// shipment_package
+	@(DataBaseAccess.append) QueryParams cmd2= () @safe pure{
+		QueryParams result;
+		with(result){
+			sqlCommand= `INSERT INTO shipment_package
 SELECT *
-FROM (VALUES ($1::DATE, $2::TEXT, $3::TEXT, $4::SMALLINT)
-      ) AS temp(shipment_date, crop_name, package_config, quantity)
+FROM (VALUES ($1::INTEGER, $2::TEXT, $3::SMALLINT)
+      ) AS temp(tr_id, package_config, quantity)
 WHERE NOT EXISTS(
   SELECT *
   FROM shipment_package
-  WHERE shipment_date = $1::DATE
-    AND crop_name = $2::TEXT
-    AND package_config = $3::TEXT);};
-    args[1]= toValue(cropName);
-  }
+  WHERE tr_id = $1::INTEGER
+    AND package_config = $2::TEXT);`;
+			args.length= 3;
+		}
+		return result;
+	}();
 
-  enum string COMMON_PROCESS= q{
-    if(totalMass > 0){
-      cmd1.args[2]= toValue(classStr[idxCol]);
-      cmd1.args[3]= toValue(to!string(totalMass));
-      conn.execParams(cmd1);
-    }
-    else continue;
-  };
+	enum string COMMON_PROCESS= q{
+		if(totalMass > 0){
+			cmd1.args[1]= toValue(classStr[idxCol]);
+			cmd1.args[2]= toValue(to!string(totalMass));
+			conn.execParams(cmd1);
+		}
+		else continue;
+	};
 
-  // date of the latest quantity data
-  const Date dateStart= (in Settings spec, in Crops theCrop){
-    import frontend: Mode;
-    immutable queryStr= "SELECT MAX(shipment_date) "
-      ~"FROM shipment_package "
-      ~"WHERE crop_name = '" ~cropNameStr(theCrop)  ~"';";
-    Date result;
+	// csv reading
+	{
+		import std.datetime: Date;
+		import std.stdio: writefln;
+		import process: searchResultTrList, addTrList;
 
-    if(spc.isSetStart){
-      result= spc.dateStart;
-    }
-    else{
-      if(spc.mode == Mode.append){ // automatically acquisition
-	auto ans= conn.exec(queryStr);
-	result= Date.fromISOExtString(ans[0][0].as!string);
-      }
-      else{}
-    }
-    return result;
-  }(spc, crop);
+		size_t rowCountCSV= bufCSV.offset;
+		int seqTr;
+		Date objDate;
 
-  // csv reading
-  {
-    import std.datetime: Date;
-    import std.stdio: writefln;
+		foreach(record; csvReader!(string[string])(bufCSV.validData.dup, null)){
+		TRANSACTION_CHECKING:
+			objDate= Date.fromISOExtString(record["shipment[yyyy-MM-dd]"]);
 
-    Date objDate;
-    foreach(record; csvReader!(string[string])(dataStrCSV.dup, null)){
-      objDate= Date.fromISOExtString(record["date[yyyy-MM-dd]"]);
+			// date checking
+			{
+		if(objDate < spc.dateStart){
+			writefln!"NOTICE: data of %s is skipped"(objDate.toISOExtString);
+			continue;
+		}
 
-      if(spc.isSetStart && objDate < dateStart){
-        writefln!"NOTICE: data of %s is skipped"(objDate.toISOExtString);
-	continue;
-      }
+		if(objDate > spc.dateEnd){
+			writefln!"NOTICE: data of %s is skipped"(objDate.toISOExtString);
+			continue;
+		}
+	}
 
-      if(spc.isSetEnd && objDate > spc.dateEnd){
-	writefln!"NOTICE: data of %s is skipped"(objDate.toISOExtString);
-	continue;
-      }
+      //(tr_date, minutes, shop_name, direction, reference)
+	{
+		import process: checkEvidenceFile, refFileAlreadyRegistered, commaSepTextToArray, addTrList;
+		string[] refFiles, buf;
+		Value[5] rowDataTrs;
+		rowDataTrs[0]= toValue(Date.fromISOExtString(record["shipment[yyyy-MM-dd]"]));
+		rowDataTrs[1]= Value(ValueFormat.BINARY, OidType.Int2);
+		rowDataTrs[2]= toValue(record["station"]);
+		rowDataTrs[3]= toValue("S");
 
+		refFiles= commaSepTextToArray(record["reference"]);
+		foreach(scope theFname; refFiles){
+			if(conn.refFileAlreadyRegistered(theFname)){
+				buf ~= theFname;
+			}
+			else{
+				buf ~= checkEvidenceFile(theFname, bufCSV.filename);
+			}
+		}
+		rowDataTrs[4]= toValue(buf);
+
+		seqTr= addTrList(conn, rowDataTrs);
+	}
+
+      const auto trsResult= searchResultTrList(conn, seqTr);
+
+      // 日付, 出荷先, 参照ファイル名を比較
+      cmd1.args[0]= toValue(seqTr);
+      cmd2.args[0]= cmd1.args[0];
+
+    REGISTRATION:
       if(crop is Crops.eggplant){	// eggplant
 	enum string[9] classStr= ["AL", "AM", "AS",
 				  "L", "M", "S",
@@ -111,8 +144,7 @@ WHERE NOT EXISTS(
 	enum string[2] packageConfig= ["DB8kg", "DB4kg"];
 	uint[2] packageAmount= 0;
 
-	cmd1.args[0]= toValue(objDate.toISOExtString);
-	cmd2.args[0]= cmd1.args[0];
+
 
 	foreach(size_t idxCol; 0..LEN){
 	  totalMass= 8*to!uint(record[valueHeader[idxCol]])
@@ -124,8 +156,8 @@ WHERE NOT EXISTS(
 	if(packageAmount[0]+packageAmount[1] > 0){
 	  foreach(size_t idxPackage; 0..2){
 	    if(packageAmount[idxPackage] > 0){
-	      cmd2.args[2]= toValue(packageConfig[idxPackage]);
-	      cmd2.args[3]= toValue(to!string(packageAmount[idxPackage]));
+	      cmd2.args[1]= toValue(packageConfig[idxPackage]);
+	      cmd2.args[2]= toValue(to!string(packageAmount[idxPackage]));
 	      conn.execParams(cmd2);
 	    }
 	    else continue;
@@ -143,9 +175,7 @@ WHERE NOT EXISTS(
 	enum LEN= classStr.length;
 	uint packageAmount= 0;
 
-	cmd1.args[0]= toValue(objDate.toISOExtString);
-	cmd2.args[0]= cmd1.args[0];
-	cmd2.args[2]= toValue("DB2kg");
+	cmd2.args[1]= toValue("DB2kg");
 
 	foreach(size_t idxCol; 0..LEN){
 	  totalMass= 2*to!uint(record[valueHeader[idxCol]]);
@@ -153,7 +183,7 @@ WHERE NOT EXISTS(
 	  packageAmount += to!uint(record[valueHeader[idxCol]]);
 	}
 	if(packageAmount > 0){
-	  cmd2.args[3]= toValue(to!string(packageAmount));
+	  cmd2.args[2]= toValue(to!string(packageAmount));
 	  conn.execParams(cmd2);
 	}
 	else{
@@ -166,9 +196,7 @@ WHERE NOT EXISTS(
 	enum LEN= classStr.length;
 	uint packageAmount= 0;
 
-	cmd1.args[0]= toValue(objDate.toISOExtString);
-	cmd2.args[0]= cmd1.args[0];
-	cmd2.args[2]= toValue("DB5kg");
+	cmd2.args[1]= toValue("DB5kg");
 
 	foreach(size_t idxCol; 0..LEN){
 	  totalMass= 5*to!uint(record[valueHeader[idxCol]]);
@@ -176,7 +204,7 @@ WHERE NOT EXISTS(
 	  packageAmount += to!uint(record[valueHeader[idxCol]]);
 	}
 	if(packageAmount > 0){
-	  cmd2.args[3]= toValue(to!string(packageAmount));
+	  cmd2.args[2]= toValue(to!string(packageAmount));
 	  conn.execParams(cmd2);
 	}
 	else{
@@ -186,6 +214,7 @@ WHERE NOT EXISTS(
       else{
 	assert(false);
       }
+      ++rowCountCSV;
     }
   }
 }
